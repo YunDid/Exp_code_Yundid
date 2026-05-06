@@ -3,6 +3,7 @@ import time
 import maxlab as mx
 
 try:
+    from .cfg_utils import extract_electrodes as extract_cfg_electrodes
     from .stimulation_api import build_mapping_diag_from_el2unit
     from .system_api import (
         configure_and_powerup_stim_units,
@@ -14,6 +15,7 @@ try:
         poweroff_all_stim_units,
     )
 except ImportError:
+    from cfg_utils import extract_electrodes as extract_cfg_electrodes
     from stimulation_api import build_mapping_diag_from_el2unit
     from system_api import (
         configure_and_powerup_stim_units,
@@ -195,14 +197,15 @@ def setup_routing_dual_stim_pools(
     primary_pool: list[int],
     secondary_pool: list[int],
 ) -> tuple[mx.Array, list[int], dict[int, int]]:
-    """对照组启动：把两组 stim 电极一次性 select 进同一次 routing。
+    """[DEPRECATED] 双池合并启动方案。
 
-    所有电极的 amplifier 路由在启动期一次性建立；后续 ``switch_stim_pool``
-    只切 stim_unit 连接（disconnect/connect/query/download），无需再 route。
+    放弃原因：用户 2026-05-06 实测肯定确认 —— 即使两组 stim 电极都在启动期 select,
+    切换 stim 桥接 + download 仍**无法**让新 stim 在硬件层生效。每次 download 之前必须
+    重新 select_electrodes(record) + route。当前 ``run_protocol_control`` 启动期改回
+    ``setup_routing_and_units``（与实验组同路径），切换期 ``switch_stim_pool`` 走完整
+    select(record + new_stim) + route + download。
 
-    启动期对 primary_pool 调 connect_electrode_to_stimulation + query 拿 unit_id；
-    启动后做 mx.offset + clear_events（这是启动期唯一的零点校准）；切换期间不再 offset。
-    返回 array、primary_pool 对应 stim_units 列表、primary el2unit 字典。
+    保留本函数仅供历史对照与未来再次评估，**新代码不要调用**。
     """
     wells = cfg["wells"]
     rec_electrodes = cfg["recording_electrodes"]
@@ -262,52 +265,70 @@ def setup_routing_dual_stim_pools(
 def switch_stim_pool(
     cfg: dict,
     array: mx.Array,
-    old_stim_electrodes: list[int],
     new_stim_electrodes: list[int],
     label: str,
 ) -> tuple[list[int], dict[int, int]]:
-    """对照组运行时切换 stim 池：disconnect 旧 + connect 新 + query + download。
+    """对照组运行时切换 stim 池：完整 select(record + new_stim) + route + connect+query + download。
 
-    前提：启动期已通过 ``setup_routing_dual_stim_pools`` 把两组 stim 电极一起 select+route，
-    两组的 amplifier 路由都已建立；本函数**不**再调用 ``array.reset`` /
-    ``clear_selected_electrodes`` / ``select_stimulation_electrodes`` / ``route``，避免触
-    发文档明确的 *"any manual switch settings ... are lost after the routing"* 副作用。
+    用户 2026-05-06 实测肯定确认：``array.download(wells)`` 之前必须连同 cfg 的 record
+    电极一起 ``select_electrodes`` + ``route``，不能跳过 record 只声明 stim。
+    单独 route 刺激电极后再 download 不会让 record 路由生效。
 
-    切换不调 ``mx.offset`` / ``mx.clear_events`` / ``time.sleep(waitAfterDownload)``：
-      - clear_events 会清 server buffer 并擦 .h5 frame metadata 已写入的 Event 标记，
-        切换中保留事件历史是首要诉求；
-      - offset 是启动期一次性零点校准，用户确认切换期间不再做；
-      - 硬件稳定时间由 protocol 默认 rest（rest_after_train_s 等）承担。
+    切换流程（每一步都对应文档语义）：
+      1. ``poweroff_all_stim_units()``                    关旧 stim 输出
+      2. ``array.clear_selected_electrodes()``            清旧 selected，避免累积
+      3. ``array.select_electrodes(record_electrodes)``   重新声明 record（**关键**）
+      4. ``array.select_stimulation_electrodes(new_stim)`` 声明新 stim
+      5. ``array.route()``                                record + new_stim 一起 route
+                                                          （会清空旧 stim manual switch）
+      6. ``connect_electrode_to_stimulation(new_el)`` × N + query → unit_ids
+      7. ``array.download(wells)``                        下发硬件
+      8. ``configure_and_powerup_stim_units(new_units)``  上电
+
+    切换**不**调（与启动期 setup_routing_and_units 区别）：
+      - ``mx.offset()``                              用户指示切换不再做零点校准
+      - ``time.sleep(mx.Timing.waitAfterDownload)``  用 protocol 默认 rest 兜稳定
+      - ``mx.clear_events()``                        保留 .h5 frame metadata 中已写入的 Event
+      - ``array.reset()``                            没必要，clear_selected + 新 select 即可
 
     返回新池的 stim_units 列表与 electrode->unit 字典。
     """
+    config_file = cfg.get("config")
+    if not config_file:
+        raise RuntimeError(
+            "switch_stim_pool requires cfg['config'] to point at a Maxwell .cfg "
+            "file so record electrodes can be re-selected before download."
+        )
+
+    record_electrodes = extract_cfg_electrodes(config_file)
+    if not record_electrodes:
+        raise RuntimeError(
+            f"Failed to parse any record electrodes from cfg='{config_file}'."
+        )
+
     print(
-        f"[SWITCH] '{label}': disconnect {len(old_stim_electrodes)} old, "
-        f"connect {len(new_stim_electrodes)} new (no reset/route/offset/clear_events)"
+        f"[SWITCH] '{label}': re-route record={len(record_electrodes)} + "
+        f"new_stim={len(new_stim_electrodes)} (no offset/wait/clear_events/reset)"
     )
 
-    # 关掉所有旧 stim_unit 的输出（不动 amplifier 路由）。
+    # 关掉所有旧 stim_unit 的输出。array 软件层 selected 在 route() 后会被
+    # 重置（"empty start"），无需手动 disconnect 旧 stim 桥接。
     poweroff_all_stim_units()
 
-    # 断开旧 stim 电极的 stim_unit 连接：旧 unit 释放回池，amplifier 路由保留。
-    for old_electrode in old_stim_electrodes:
-        result = array.disconnect_electrode_from_stimulation(old_electrode)
-        if result is not None and str(result).strip().lower() == "error":
-            # 容忍：可能某个电极此前已被 disconnect / 或 SDK 把 idempotent 当 error 报告。
-            print(
-                f"[SWITCH] disconnect_electrode_from_stimulation({old_electrode}) "
-                f"returned {result!r}; continue."
-            )
+    array.clear_selected_electrodes()
+    array.select_electrodes(record_electrodes)
+    array.select_stimulation_electrodes(list(new_stim_electrodes))
+    array.route()
 
-    # 给新 stim 电极建 stim_unit 连接 + query 拿 unit_id。
-    # connect_stim_units_to_stim_electrodes 内部会先校验 amplifier 已 routed —
-    # 如果 setup_routing_dual_stim_pools 启动期 select 没覆盖到新电极会在此处报错。
+    # connect_stim_units_to_stim_electrodes 内部先 query_amplifier_at_electrode
+    # 校验 routed，再 connect_electrode_to_stimulation + query_stimulation_at_electrode
+    # 拿 unit_id；amplifier 路由失败会立即报错。
     new_stim_units = connect_stim_units_to_stim_electrodes(new_stim_electrodes, array)
 
-    # download 把新的 stim_unit 连接下发硬件；此后录音文件中的 Event 帧依然连续。
+    # download 把刚 route 的整套配置（含 record + new_stim）下发硬件。
     array.download(cfg["wells"])
+    # 不调 mx.Timing.waitAfterDownload sleep / mx.offset / mx.clear_events。
 
-    # 上电 + connect=True 新 unit；启动期约定一致。
     configure_and_powerup_stim_units(new_stim_units)
 
     el2unit = {
@@ -317,7 +338,6 @@ def switch_stim_pool(
 
     new_diag = build_mapping_diag_from_el2unit(el2unit)
     if new_diag.get("conflicts"):
-        # 切换中冲突属于硬件路由偏移，立即停以便排查。
         _raise_if_direct_mapping_has_conflicts(new_diag)
 
     print(

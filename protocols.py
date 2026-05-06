@@ -11,7 +11,6 @@ try:
     from .recording_api import (
         preview_stim_mapping,
         setup_routing_and_units,
-        setup_routing_dual_stim_pools,
         start_recording,
         stop_recording,
         switch_stim_pool,
@@ -30,7 +29,6 @@ except ImportError:
     from recording_api import (
         preview_stim_mapping,
         setup_routing_and_units,
-        setup_routing_dual_stim_pools,
         start_recording,
         stop_recording,
         switch_stim_pool,
@@ -616,24 +614,27 @@ def run_protocol_control(cfg: dict) -> dict:
     try:
         initialize_system()
 
-        # 启动期一次性 select 两组 stim 电极进同一次 routing：
-        # 实验组 + 对照组的 amplifier 路由都建立；启动期只对实验组 connect+query 拿 unit。
-        # 后续 switch_stim_pool 切换时只 disconnect/connect/query/download，不再 route。
-        # cfg["stim_electrodes"] 由 _sync_protocol_stim_electrodes_from_modes 已设为实验组 32 池。
+        # 启动期与实验组路径完全一致：select(record) + select_stim(实验组 32) +
+        # route + connect+query + download + offset + clear_events。
+        # cfg["stim_electrodes"] 已由 _sync_protocol_stim_electrodes_from_modes 设为实验组 32 池。
+        # 后续每次切换 train↔test 时 switch_stim_pool 走完整 select+route 路径
+        # 把 record + 新 stim 一起 route 后 download，确保每次 download 都含 record。
         exp_stim_electrodes = cfg["stim_electrodes"]
-        array, exp_stim_units, exp_el2unit = setup_routing_dual_stim_pools(
-            cfg,
-            primary_pool=exp_stim_electrodes,
-            secondary_pool=control_pool,
-        )
+        array, exp_stim_units = setup_routing_and_units(cfg)
         saving = start_recording(cfg)
-        # setup_routing_dual_stim_pools 内 download 之前已 connect+query；download 后这里只 power_up。
         configure_and_powerup_stim_units(exp_stim_units)
 
-        # diagnostics 已被 setup_routing_dual_stim_pools 写入 cfg；如冲突会直接 raise。
-        diag_conflicts = cfg.get("stim_mapping_diagnostics", {}).get("n_conflict_units", 0)
+        exp_el2unit = {
+            electrode: unit
+            for electrode, unit in zip(exp_stim_electrodes, exp_stim_units)
+        }
+        cfg["stim_mapping_diagnostics"] = merge_mapping_diagnostics(
+            cfg.get("stim_mapping_diagnostics"),
+            exp_el2unit,
+        )
+        diag_conflicts = cfg["stim_mapping_diagnostics"].get("n_conflict_units", 0)
         if diag_conflicts:
-            print(f"[MAPPING][CTRL] {diag_conflicts} conflict units in primary pool")
+            print(f"[MAPPING][CTRL] {diag_conflicts} conflict units in experimental pool")
 
         do_spontaneous(proto_cfg["pre_spontaneous_s"], tag="pre_protocol")
 
@@ -653,22 +654,18 @@ def run_protocol_control(cfg: dict) -> dict:
             }
         )
 
-        # 当前活跃 stim 池子：用于 switch 时知道要 disconnect 哪一组。
-        current_active_pool = list(exp_stim_electrodes)
-
         pattern_order = proto_cfg["pattern_order"]
         for pattern_index, pattern_name in enumerate(pattern_order):
             pattern_modes = _modes_for_pattern(cfg, pattern_name)
             for cycle_index in range(1, proto_cfg["cycles_per_pattern"] + 1):
-                # === 切到对照组 stim 池：disconnect 实验组 + connect 对照组 + download ===
+                # === 切到对照组 stim 池：clear_selected + select(record + control) + route +
+                # connect(control) + query + download，不做 offset/wait/clear_events/reset ===
                 ctrl_stim_units, ctrl_el2unit = switch_stim_pool(
                     cfg,
                     array=array,
-                    old_stim_electrodes=current_active_pool,
                     new_stim_electrodes=control_pool,
                     label="control",
                 )
-                current_active_pool = list(control_pool)
                 results["protocol_steps"].append(
                     {
                         "type": "switch_routing",
@@ -708,15 +705,13 @@ def run_protocol_control(cfg: dict) -> dict:
                     tag=f"after_{pattern_name}_train{cycle_index}",
                 )
 
-                # === 切回实验组 stim 池进行 test ===
+                # === 切回实验组 stim 池进行 test：同样走完整 select(record + experimental) + route ===
                 exp_stim_units, exp_el2unit = switch_stim_pool(
                     cfg,
                     array=array,
-                    old_stim_electrodes=current_active_pool,
                     new_stim_electrodes=exp_stim_electrodes,
                     label="experimental",
                 )
-                current_active_pool = list(exp_stim_electrodes)
                 results["protocol_steps"].append(
                     {
                         "type": "switch_routing",
