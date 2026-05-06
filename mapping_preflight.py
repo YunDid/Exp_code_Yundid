@@ -81,6 +81,27 @@ def _new_run_artifacts(cfg: dict) -> tuple[str, Path]:
     return timestamp, out_dir / f"mapping_preflight_{timestamp}.log"
 
 
+def _build_direct_probe_config(
+    base_cfg: dict,
+    stim_electrodes: list[int],
+) -> dict:
+    """直连 probe 配置：strategy=prechecked，不走 neighbor_retry / 不做 substitutions。"""
+    cfg = deepcopy(base_cfg)
+    mapping_cfg = cfg.setdefault("stim_mapping", {})
+
+    stim_electrodes = list(stim_electrodes)
+    max_electrodes = mapping_cfg.get("max_electrodes", 32)
+    if len(stim_electrodes) > max_electrodes:
+        raise ValueError(
+            f"Preflight received {len(stim_electrodes)} electrodes, "
+            f"but the configured limit is {max_electrodes}."
+        )
+
+    cfg["stim_electrodes"] = stim_electrodes
+    mapping_cfg["strategy"] = "prechecked"
+    return cfg
+
+
 def _build_preflight_config(
     base_cfg: dict,
     stim_electrodes: list[int],
@@ -187,6 +208,16 @@ def _override_mapping_diag_with_narrow_set(
             mapping_diag[key] = final_route_diag[key]
 
 
+def _print_electrode_unit_pairs(
+    electrodes: list[int], electrode2unit: dict
+) -> None:
+    """每行打印一对 electrode -> stim_unit，便于交叉校验。"""
+    print("[PRECHECK] electrode -> stim_unit:")
+    for electrode in electrodes:
+        unit = electrode2unit.get(str(electrode), "?")
+        print(f"  {electrode} -> {unit}")
+
+
 def main() -> None:
     requested_stim_electrodes = [
         304, 1019, 2024, 2749, 3838, 7346, 5984, 6076,
@@ -200,8 +231,54 @@ def main() -> None:
     timestamp, log_path = _new_run_artifacts(CONFIG)
 
     with _tee_terminal_to_log(log_path):
-        print(f"[PRECHECK] requested_stim_electrodes={requested_stim_electrodes}")
-        print(f"[PRECHECK] electrode_count={len(requested_stim_electrodes)}")
+        print(
+            f"[PRECHECK] requested electrodes ({len(requested_stim_electrodes)}): "
+            f"{requested_stim_electrodes}"
+        )
+
+        # ===== 阶段 1：直连 probe =====
+        # 不走 neighbor_retry / 不替换电极；只看输入电极本身是否在 select+route 后无冲突。
+        # 无冲突就直接结束；有冲突才进入阶段 2。
+        print("\n[PRECHECK] step 1: probe direct mapping (no neighbor search) ...")
+        try:
+            direct_cfg = _build_direct_probe_config(CONFIG, requested_stim_electrodes)
+            direct_diag = preview_stim_mapping(direct_cfg)
+        except Exception as exc:
+            print(f"[PRECHECK] direct probe failed: {exc}")
+            print("[PRECHECK] do not start the formal experiment.")
+            return
+
+        if not direct_diag.get("conflicts"):
+            print("[PRECHECK] direct mapping has no conflicts; ready to import as-is.")
+            _print_electrode_unit_pairs(
+                requested_stim_electrodes, direct_diag.get("electrode2unit", {})
+            )
+
+            save_experiment_json(
+                cfg=direct_cfg,
+                out_name_prefix="mapping_preflight",
+                extra_meta={
+                    "run_type": "mapping_preflight",
+                    "mapping_preflight": {
+                        "phase": "direct_probe_only",
+                        "requested_electrodes": list(requested_stim_electrodes),
+                        "resolved_electrodes": list(requested_stim_electrodes),
+                        "n_substitutions": 0,
+                        "n_conflict_units": 0,
+                        "electrode2unit": direct_diag.get("electrode2unit", {}),
+                        "unit2electrodes": direct_diag.get("unit2electrodes", {}),
+                    },
+                },
+                timestamp=timestamp,
+            )
+            return
+
+        # ===== 阶段 2：有冲突 → neighbor_retry 邻居替换 + final direct route check =====
+        n_conflict = direct_diag.get("n_conflict_units", 0)
+        print(
+            f"[PRECHECK] direct mapping has {n_conflict} conflict unit(s); "
+            f"start neighbor_retry search."
+        )
         print(f"[PRECHECK] neighbor_radius={neighbor_radius}")
         print(f"[PRECHECK] verification_max_iterations={verification_max_iterations}")
 
@@ -251,11 +328,9 @@ def main() -> None:
             print("[PRECHECK] do not start the formal experiment.")
         elif final_route_diag is None:
             print("[PRECHECK] final direct route check did not run; do not start the formal experiment.")
-        elif mapping_diag.get("n_substitutions", 0) > 0:
+        else:
             print("[PRECHECK] resolved_electrodes is the electrode group to import.")
             print(f"[PRECHECK] resolved_electrodes={mapping_diag.get('resolved_electrodes', [])}")
-        else:
-            print("[PRECHECK] requested electrodes are already conflict-free.")
 
 
 if __name__ == "__main__":
