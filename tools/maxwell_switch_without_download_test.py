@@ -69,7 +69,9 @@ from system_api import (
 PULSE_AMPLITUDE_MV = 200
 PULSE_PHASE_SAMPLES = 4
 N_PULSES_PER_PHASE = 3
-INTER_PULSE_S = 0.5
+# 5s 间隔便于示波器肉眼区分相邻刺激尖刺；
+# 单脉冲本身仍是 200μs × 2 双相，间隔与脉冲形状无关。
+INTER_PULSE_S = 5.0
 
 
 def _is_error(value) -> bool:
