@@ -38,6 +38,7 @@ try:
     from .experiment_config import CONFIG
     from .protocols import (
         run_protocol,
+        run_protocol_control,
         run_random_stim_experiment,
         save_experiment_json,
     )
@@ -45,6 +46,7 @@ except ImportError:
     from experiment_config import CONFIG
     from protocols import (
         run_protocol,
+        run_protocol_control,
         run_random_stim_experiment,
         save_experiment_json,
     )
@@ -93,6 +95,12 @@ def _tee_terminal_to_log(log_path: Path):
 
 
 def main() -> None:
+    # 正式实验严格走 strategy=prechecked 直连路径：
+    #   - mapping_preflight.py 跑完后产出无冲突的 resolved_electrodes 列表；
+    #   - 用户把 resolved_electrodes 填回 experiment_config.py 的 stim_electrodes；
+    #   - 正式实验只在此处校验「prechecked」，再下沉到 setup_routing_and_units 直接
+    #     connect+query+download，不再触发任何邻居搜索 / 替换 / 验证迭代。
+    # 若仍出现冲突，说明输入电极组本身有问题，应回到 mapping_preflight 重选。
     if CONFIG.get("stim_mapping", {}).get("strategy") == "neighbor_retry":
         raise RuntimeError(
             "neighbor_retry is preflight-only. Run mapping_preflight.py first, then "
@@ -112,13 +120,28 @@ def main() -> None:
     #     )
 
     # 2. Test/train protocol experiment
-    timestamp, log_path = _new_run_artifacts("protocol")
+    # 按 CONFIG["experiment_group"] 分流：
+    #   "experimental"：原 run_protocol，路径与逻辑完全不变。
+    #   "control"：run_protocol_control，对照组每 cycle 切换 routing 跑随机 10 unit 训练。
+    experiment_group = CONFIG.get("experiment_group", "experimental")
+    if experiment_group not in ("experimental", "control"):
+        raise ValueError(
+            f"Unsupported experiment_group: {experiment_group!r}. "
+            "Expected 'experimental' or 'control'."
+        )
+
+    out_name_prefix = "protocol" if experiment_group == "experimental" else "protocol_control"
+    timestamp, log_path = _new_run_artifacts(out_name_prefix)
     with _tee_terminal_to_log(log_path):
-        results = run_protocol(CONFIG)
+        print(f"[MAIN] experiment_group={experiment_group}")
+        if experiment_group == "experimental":
+            results = run_protocol(CONFIG)
+        else:
+            results = run_protocol_control(CONFIG)
         print("Protocol results:", results)
         save_experiment_json(
             cfg=CONFIG,
-            out_name_prefix="protocol",
+            out_name_prefix=out_name_prefix,
             protocol_results=results,
             timestamp=timestamp,
         )

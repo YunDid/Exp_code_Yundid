@@ -59,7 +59,25 @@ recording_electrodes = [
 # 当前实验直接使用的刺激电极池。
 # 正式实验只使用已经完成预检的电极；冲突搜索在 mapping_preflight.py 中单独执行。
 max_stim_electrodes = 32
-stim_electrodes = [304, 1019, 2024, 2749, 3838, 7346, 5984, 6076, 7963, 10482, 8461, 10506, 18617, 12312, 13166, 14097, 12630, 16489, 17444, 13755, 13369, 18462, 18653, 19678, 20524, 20717, 20506, 22772, 23035, 23204, 24739, 25563]
+
+# 实验组刺激电极池：四个 pattern x 四种 mode 的电极并集，共 32 个。
+# 与 stim_patterns 严格对齐，不要单独修改这一行 —— 跑 protocol 时会从 stim_patterns 自动同步。
+experimental_stim_electrodes = [304, 1019, 2024, 2749, 3838, 7346, 5984, 6076, 7963, 10482, 8461, 10506, 18617, 12312, 13166, 14097, 12630, 16489, 17444, 13755, 13369, 18462, 18653, 19678, 20524, 20717, 20506, 22772, 23035, 23204, 24739, 25563]
+
+# 对照组刺激电极池：另一组无冲突电极，独立于实验组。长度可变（建议 25-32 个；硬上限 32）。
+# 由 mapping_preflight.py 单独跑出后手动替换占位列表。
+# 池子大小 N 不必 ==32，但必须 N >= control_train.n_random_per_pulse。
+# 对照组训练时不区分 mode，运行时从这 N 个里随机抽取 control_train.n_random_per_pulse 个 unit 同时刺激。
+control_stim_electrodes = [
+    100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
+    1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000,
+    2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900, 3000,
+    3100, 3200,
+]
+
+# 实验组别名，用于兼容历史代码路径与冠吉旧脚本引用。
+# protocols.run_protocol 仍然通过 _sync_protocol_stim_electrodes_from_modes 在运行时重写 cfg["stim_electrodes"]。
+stim_electrodes = experimental_stim_electrodes
 
 # 四个完整图案的占位配置。后续根据离线选电极结果手动替换。
 # mode8/mode6/mode4 当前先取对应 mode10 的子集，保证 protocol 校验可通过。
@@ -107,10 +125,16 @@ def _build_test_modes(patterns):
 
 
 def _validate_pattern_config():
-    if len(stim_electrodes) > max_stim_electrodes:
+    if len(experimental_stim_electrodes) > max_stim_electrodes:
         raise ValueError(
-            f"stim_electrodes must contain at most {max_stim_electrodes} electrodes."
+            f"experimental_stim_electrodes must contain at most {max_stim_electrodes} electrodes."
         )
+    if len(control_stim_electrodes) > max_stim_electrodes:
+        raise ValueError(
+            f"control_stim_electrodes must contain at most {max_stim_electrodes} electrodes."
+        )
+    if len(control_stim_electrodes) != len(set(control_stim_electrodes)):
+        raise ValueError("control_stim_electrodes must not contain duplicates.")
 
     for pattern_name, pattern_modes in stim_patterns.items():
         if "mode10" not in pattern_modes:
@@ -129,10 +153,16 @@ _validate_pattern_config()
 test_modes = _build_test_modes(stim_patterns)
 
 CONFIG = {
+    # 实验组别 / 对照组别切换。"experimental" 走原有 protocol；"control" 走对照组 protocol。
+    # 对照组训练时从 control_stim_electrodes 32 池随机抽取 control_train.n_random_per_pulse 个 unit
+    # 同时刺激；test 阶段切换 routing 回到实验组 32 池，跑相同的 mode 测试。
+    "experiment_group": "experimental",  # "experimental" | "control"
     # Maxwell well 与电极配置：决定本次实验在哪个 well 上记录、哪些电极参与记录和刺激。
     "wells": [0],  # Maxwell 的 well 编号列表。单孔 MaxOne 通常保持为 [0]。
     "recording_electrodes": recording_electrodes,  # 仅在 config == "" 时作为记录电极兜底输入。
-    "stim_electrodes": stim_electrodes,  # 本次实验请求使用的刺激电极列表。
+    "stim_electrodes": stim_electrodes,  # 本次实验请求使用的刺激电极列表。实验组运行时由 modes 自动同步。
+    "experimental_stim_electrodes": experimental_stim_electrodes,  # 实验组 32 池（与 stim_patterns 对齐）。
+    "control_stim_electrodes": control_stim_electrodes,  # 对照组池（≤32，长度可变，需 mapping_preflight 预检后填入）。
     "stim_patterns": stim_patterns,  # 四个完整图案及其缺失子图模式。
     "config": "/home/maxwell/configs/260227/pi_16h44m18s.cfg",  # 非空时：从该 cfg 解析记录电极。空字符串时：回退到 recording_electrodes。
     # 刺激电极映射配置。
@@ -180,6 +210,14 @@ CONFIG = {
     "train_block": {
         "freq_hz": 1.0,  # train block 内完整 10mode 的刺激频率。
         "pulses": 60,  # train block 内完整 10mode 的刺激次数。
+    },
+    # 对照组训练专属参数：
+    # - 训练频率与脉冲数复用 train_block.freq_hz / train_block.pulses。
+    # - 单脉冲波形参数复用 train_pulse 的 phase / amplitude_mV / dac_channel。
+    # - n_random_per_pulse 决定每次脉冲从 control_stim_electrodes 池子中随机抽几个 unit 同时刺激；
+    #   池子长度 N 必须 >= n_random_per_pulse；池长度本身不限定 32（10/15/20/25/32 均可）。
+    "control_train": {
+        "n_random_per_pulse": 10,  # 每次刺激随机选出的 stim_unit 数量；与实验组 mode10 对齐。
     },
     # 正式实验总流程配置：决定自发记录、全局 test、四个 pattern 训练测试循环与休息时间。
     "protocol_flow": {

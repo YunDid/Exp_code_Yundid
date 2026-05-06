@@ -11,8 +11,10 @@ try:
     from .recording_api import (
         preview_stim_mapping,
         setup_routing_and_units,
+        setup_routing_dual_stim_pools,
         start_recording,
         stop_recording,
+        switch_stim_pool,
     )
     from .stimulation_api import (
         build_sequence_from_cfg,
@@ -28,8 +30,10 @@ except ImportError:
     from recording_api import (
         preview_stim_mapping,
         setup_routing_and_units,
+        setup_routing_dual_stim_pools,
         start_recording,
         stop_recording,
+        switch_stim_pool,
     )
     from stimulation_api import (
         build_sequence_from_cfg,
@@ -364,6 +368,72 @@ def run_random_stim_experiment(cfg: dict) -> list[list[int]]:
     return all_orders
 
 
+def run_train_block_control(
+    cfg: dict,
+    stim_units_all: list[int],
+    el2unit: dict[int, int],
+    pattern_name: str,
+    cycle_index: int,
+) -> list[dict]:
+    """对照组训练块：每次脉冲从 32 池随机抽 N 个 unit 同时刺激。
+
+    频率 / 脉冲数沿用 cfg["train_block"]，单脉冲波形沿用 cfg["train_pulse"]。
+    每次抽样的 unit / electrode 列表写入返回的日志列表（同时打印到终端）。
+    """
+    import random
+
+    train_cfg = cfg["train_block"]
+    pulses = train_cfg["pulses"]
+    freq_hz = train_cfg["freq_hz"]
+    isi_s = 1.0 / freq_hz
+
+    control_cfg = cfg["control_train"]
+    n_random = control_cfg["n_random_per_pulse"]
+
+    if n_random > len(stim_units_all):
+        raise ValueError(
+            f"control_train.n_random_per_pulse={n_random} exceeds "
+            f"control pool size {len(stim_units_all)}."
+        )
+
+    unit_to_electrode = {unit: electrode for electrode, unit in el2unit.items()}
+
+    sampling_log: list[dict] = []
+
+    for pulse_index in range(pulses):
+        sampled_units = random.sample(stim_units_all, n_random)
+        sampled_electrodes = [unit_to_electrode[unit] for unit in sampled_units]
+
+        connect_units_subset(stim_units_all, sampled_units)
+
+        seq = build_single_pulse_sequence(
+            cfg,
+            label=(
+                f"CTRL_TRAIN_{pattern_name}_cycle{cycle_index}_pulse{pulse_index + 1}"
+            ),
+            pulse_config_key="train_pulse",
+        )
+        print(
+            f"[TRAIN][CTRL] {pattern_name} cycle {cycle_index} "
+            f"pulse {pulse_index + 1}/{pulses} "
+            f"units={sampled_units} electrodes={sampled_electrodes}"
+        )
+        seq.send()
+
+        sampling_log.append(
+            {
+                "pulse_index": pulse_index + 1,
+                "sampled_units": sampled_units,
+                "sampled_electrodes": sampled_electrodes,
+            }
+        )
+
+        time.sleep(isi_s)
+
+    disconnect_all_units(stim_units_all)
+    return sampling_log
+
+
 def run_protocol(cfg: dict) -> dict:
     """Run pre-spontaneous/test/pattern training/post-spontaneous protocol."""
     proto_cfg = cfg["protocol_flow"]
@@ -403,12 +473,14 @@ def run_protocol(cfg: dict) -> dict:
             cfg.get("stim_mapping_diagnostics"),
             el2unit,
         )
-        print(
-            "[MAPPING]",
-            cfg["stim_mapping_diagnostics"]["n_conflict_units"],
-            "conflict units; extra_electrodes_due_to_conflicts=",
-            cfg["stim_mapping_diagnostics"]["extra_electrodes_due_to_conflicts"],
-        )
+        # 任务 7：信任 prechecked 输入；只在确实出现冲突时才打额外诊断。
+        if cfg["stim_mapping_diagnostics"]["n_conflict_units"]:
+            print(
+                "[MAPPING]",
+                cfg["stim_mapping_diagnostics"]["n_conflict_units"],
+                "conflict units; extra_electrodes_due_to_conflicts=",
+                cfg["stim_mapping_diagnostics"]["extra_electrodes_due_to_conflicts"],
+            )
 
         do_spontaneous(proto_cfg["pre_spontaneous_s"], tag="pre_protocol")
 
@@ -481,6 +553,217 @@ def run_protocol(cfg: dict) -> dict:
         results["status"] = "interrupted"
         results["interrupted"] = True
         print("[INTERRUPT] protocol interrupted; partial results will be saved.")
+    finally:
+        if saving is not None:
+            stop_recording(saving)
+
+    return results
+
+
+def run_protocol_control(cfg: dict) -> dict:
+    """对照组 protocol：流程与实验组一致，train block 从对照组 32 池随机抽 N unit。
+
+    流程：
+      pre_spontaneous
+      → GLOBAL TEST                          （实验组 routing）
+      → for pattern in 4 patterns:
+          for cycle in 1..N:
+              switch → 对照组 routing
+              CTRL TRAIN block               （32 池随机 10 unit / pulse）
+              rest                            （兼做切换稳定时间）
+              switch → 实验组 routing
+              TEST block                      （pattern 自己的 4 mode）
+          rest_between_patterns
+      → post_spontaneous
+
+    切换 routing 不调 mx.offset 与 waitAfterDownload，硬件稳定时间由 rest 时长承担。
+    """
+    proto_cfg = cfg["protocol_flow"]
+
+    experimental_pool = list(cfg["experimental_stim_electrodes"])
+    control_pool = list(cfg["control_stim_electrodes"])
+    if not experimental_pool:
+        raise ValueError("experimental_stim_electrodes must not be empty.")
+    if not control_pool:
+        raise ValueError("control_stim_electrodes must not be empty.")
+
+    _sync_protocol_stim_electrodes_from_modes(cfg)
+
+    results = {
+        "experiment_group": "control",
+        "test_orders": [],
+        "protocol_steps": [],
+        "control_train_log": [],
+        "status": "running",
+        "interrupted": False,
+    }
+    saving = None
+
+    def do_rest(seconds: float, tag: str) -> None:
+        print(f"[REST] {tag}: {seconds:.1f}s")
+        results["protocol_steps"].append(
+            {"type": "rest", "tag": tag, "seconds": seconds}
+        )
+        time.sleep(seconds)
+
+    def do_spontaneous(seconds: float, tag: str) -> None:
+        print(f"[SPONTANEOUS] {tag}: {seconds:.1f}s")
+        results["protocol_steps"].append(
+            {"type": "spontaneous", "tag": tag, "seconds": seconds}
+        )
+        time.sleep(seconds)
+
+    try:
+        initialize_system()
+
+        # 启动期一次性 select 两组 stim 电极进同一次 routing：
+        # 实验组 + 对照组的 amplifier 路由都建立；启动期只对实验组 connect+query 拿 unit。
+        # 后续 switch_stim_pool 切换时只 disconnect/connect/query/download，不再 route。
+        # cfg["stim_electrodes"] 由 _sync_protocol_stim_electrodes_from_modes 已设为实验组 32 池。
+        exp_stim_electrodes = cfg["stim_electrodes"]
+        array, exp_stim_units, exp_el2unit = setup_routing_dual_stim_pools(
+            cfg,
+            primary_pool=exp_stim_electrodes,
+            secondary_pool=control_pool,
+        )
+        saving = start_recording(cfg)
+        # setup_routing_dual_stim_pools 内 download 之前已 connect+query；download 后这里只 power_up。
+        configure_and_powerup_stim_units(exp_stim_units)
+
+        # diagnostics 已被 setup_routing_dual_stim_pools 写入 cfg；如冲突会直接 raise。
+        diag_conflicts = cfg.get("stim_mapping_diagnostics", {}).get("n_conflict_units", 0)
+        if diag_conflicts:
+            print(f"[MAPPING][CTRL] {diag_conflicts} conflict units in primary pool")
+
+        do_spontaneous(proto_cfg["pre_spontaneous_s"], tag="pre_protocol")
+
+        print("[FLOW][CTRL] GLOBAL TEST (experimental routing)")
+        results["protocol_steps"].append({"type": "test", "tag": "global"})
+        global_orders = run_test_block(
+            cfg,
+            stim_units_all=exp_stim_units,
+            el2unit=exp_el2unit,
+            modes=cfg["test_block"]["modes"],
+            block_label="GLOBAL_TEST",
+        )
+        results["test_orders"].append(
+            {
+                "tag": "global",
+                "mode_order": global_orders,
+            }
+        )
+
+        # 当前活跃 stim 池子：用于 switch 时知道要 disconnect 哪一组。
+        current_active_pool = list(exp_stim_electrodes)
+
+        pattern_order = proto_cfg["pattern_order"]
+        for pattern_index, pattern_name in enumerate(pattern_order):
+            pattern_modes = _modes_for_pattern(cfg, pattern_name)
+            for cycle_index in range(1, proto_cfg["cycles_per_pattern"] + 1):
+                # === 切到对照组 stim 池：disconnect 实验组 + connect 对照组 + download ===
+                ctrl_stim_units, ctrl_el2unit = switch_stim_pool(
+                    cfg,
+                    array=array,
+                    old_stim_electrodes=current_active_pool,
+                    new_stim_electrodes=control_pool,
+                    label="control",
+                )
+                current_active_pool = list(control_pool)
+                results["protocol_steps"].append(
+                    {
+                        "type": "switch_routing",
+                        "to": "control",
+                        "pattern": pattern_name,
+                        "cycle": cycle_index,
+                    }
+                )
+
+                print(f"[FLOW][CTRL] {pattern_name} TRAIN #{cycle_index}")
+                results["protocol_steps"].append(
+                    {
+                        "type": "train",
+                        "group": "control",
+                        "pattern": pattern_name,
+                        "cycle": cycle_index,
+                    }
+                )
+                sampling_log = run_train_block_control(
+                    cfg,
+                    stim_units_all=ctrl_stim_units,
+                    el2unit=ctrl_el2unit,
+                    pattern_name=pattern_name,
+                    cycle_index=cycle_index,
+                )
+                results["control_train_log"].append(
+                    {
+                        "pattern": pattern_name,
+                        "cycle": cycle_index,
+                        "samples": sampling_log,
+                    }
+                )
+
+                # 训练后 rest，同时让对照组→实验组切换的硬件稳定时间被吸收。
+                do_rest(
+                    proto_cfg["rest_after_train_s"],
+                    tag=f"after_{pattern_name}_train{cycle_index}",
+                )
+
+                # === 切回实验组 stim 池进行 test ===
+                exp_stim_units, exp_el2unit = switch_stim_pool(
+                    cfg,
+                    array=array,
+                    old_stim_electrodes=current_active_pool,
+                    new_stim_electrodes=exp_stim_electrodes,
+                    label="experimental",
+                )
+                current_active_pool = list(exp_stim_electrodes)
+                results["protocol_steps"].append(
+                    {
+                        "type": "switch_routing",
+                        "to": "experimental",
+                        "pattern": pattern_name,
+                        "cycle": cycle_index,
+                    }
+                )
+
+                print(f"[FLOW][CTRL] {pattern_name} TEST #{cycle_index}")
+                results["protocol_steps"].append(
+                    {
+                        "type": "test",
+                        "group": "experimental",
+                        "pattern": pattern_name,
+                        "cycle": cycle_index,
+                    }
+                )
+                test_orders = run_test_block(
+                    cfg,
+                    stim_units_all=exp_stim_units,
+                    el2unit=exp_el2unit,
+                    modes=pattern_modes,
+                    block_label=f"{pattern_name}_TEST{cycle_index}",
+                )
+                results["test_orders"].append(
+                    {
+                        "tag": f"{pattern_name}_cycle{cycle_index}",
+                        "pattern": pattern_name,
+                        "cycle": cycle_index,
+                        "mode_order": test_orders,
+                    }
+                )
+
+            if pattern_index < len(pattern_order) - 1:
+                do_rest(
+                    proto_cfg["rest_between_patterns_s"],
+                    tag=f"between_{pattern_name}_and_{pattern_order[pattern_index + 1]}",
+                )
+
+        do_spontaneous(proto_cfg["post_spontaneous_s"], tag="post_protocol")
+
+        results["status"] = "completed"
+    except KeyboardInterrupt:
+        results["status"] = "interrupted"
+        results["interrupted"] = True
+        print("[INTERRUPT][CTRL] protocol interrupted; partial results will be saved.")
     finally:
         if saving is not None:
             stop_recording(saving)

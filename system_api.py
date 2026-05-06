@@ -46,6 +46,42 @@ def configure_array(
     return array
 
 
+def configure_array_dual_pool(
+    electrodes: List[int],
+    primary_stim_electrodes: List[int],
+    secondary_stim_electrodes: List[int],
+    config_file: Optional[str] = None,
+) -> mx.Array:
+    """对照组专用：把两组 stim 电极合并到一次 select_stimulation_electrodes 一起 route。
+
+    主组 + 副组联合声明，让 routing 算法同时为两组电极建立 amplifier 路由
+    （Maxwell 单 well stim 选择上限 1020，64 远低于上限）。run-time stim_unit
+    的具体分配在 connect_electrode_to_stimulation 阶段动态完成；切换时无需
+    再次调 route，只需 disconnect 旧 / connect 新 / download。
+    """
+    array = mx.Array("stimulation")
+    array.reset()
+    array.clear_selected_electrodes()
+
+    seen: set[int] = set()
+    combined_stim: List[int] = []
+    for electrode in list(primary_stim_electrodes) + list(secondary_stim_electrodes):
+        if electrode in seen:
+            continue
+        seen.add(electrode)
+        combined_stim.append(electrode)
+
+    if config_file:
+        routing_electrodes = _extract_recording_electrodes_from_config(config_file)
+        array.select_electrodes(routing_electrodes)
+    else:
+        array.select_electrodes(electrodes)
+
+    array.select_stimulation_electrodes(combined_stim)
+    array.route()
+    return array
+
+
 def load_config(config_file: str) -> mx.Array:
     """Load a previously created configuration."""
     path = Path(config_file)
