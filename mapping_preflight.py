@@ -143,6 +143,50 @@ def _run_final_route_check(preflight_cfg: dict, mapping_diag: dict) -> dict:
     return final_diag
 
 
+def _override_mapping_diag_with_narrow_set(
+    mapping_diag: dict, final_route_diag: dict
+) -> None:
+    """Override mapping_diag's unit-level fields with narrow-set routing results.
+
+    The neighbor-retry phase queries unit ids while the array is routed with the
+    expanded candidate pool. The formal experiment uses only the resolved subset,
+    which is a different routing input set; query results may differ. Use the
+    narrow-set query (final_route_check) as the authority for what the formal
+    experiment will actually see.
+    """
+    expanded_e2u = mapping_diag.get("electrode2unit", {})
+    narrow_e2u = final_route_diag.get("electrode2unit", {})
+    diffs = []
+    for el_str, narrow_unit in narrow_e2u.items():
+        expanded_unit = expanded_e2u.get(el_str)
+        if expanded_unit is not None and expanded_unit != narrow_unit:
+            diffs.append((el_str, expanded_unit, narrow_unit))
+
+    if diffs:
+        print("[PRECHECK] routing-set difference detected (expanded routing vs narrow routing):")
+        for el, e_unit, n_unit in diffs:
+            print(f"[PRECHECK]   electrode {el}: expanded={e_unit}, narrow={n_unit}")
+        print(
+            "[PRECHECK] mapping_diag unit fields overridden by narrow-set routing "
+            "(formal experiment will use these)."
+        )
+    else:
+        print("[PRECHECK] expanded vs narrow routing produces identical unit map; no override needed.")
+
+    for key in (
+        "n_electrodes",
+        "n_units_unique",
+        "n_conflict_units",
+        "extra_electrodes_due_to_conflicts",
+        "conflicts",
+        "unit2electrodes",
+        "electrode2unit",
+        "resolved_electrode2unit",
+    ):
+        if key in final_route_diag:
+            mapping_diag[key] = final_route_diag[key]
+
+
 def main() -> None:
     requested_stim_electrodes = [
         304, 1019, 2024, 2749, 3838, 7346, 5984, 6076,
@@ -151,7 +195,7 @@ def main() -> None:
         20524, 20717, 20506, 22772, 23035, 23204, 24739, 25563,
     ]
     neighbor_radius = 50
-    verification_max_iterations = 8
+    verification_max_iterations = 100
 
     timestamp, log_path = _new_run_artifacts(CONFIG)
 
@@ -180,6 +224,9 @@ def main() -> None:
             except Exception as exc:
                 final_route_error = str(exc)
                 print(f"[PRECHECK] final direct route check failed: {final_route_error}")
+
+            if final_route_diag is not None and not final_route_diag.get("conflicts"):
+                _override_mapping_diag_with_narrow_set(mapping_diag, final_route_diag)
 
         save_experiment_json(
             cfg=cfg,

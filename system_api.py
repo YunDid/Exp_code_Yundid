@@ -16,7 +16,10 @@ except ImportError:
 def initialize_system() -> None:
     """Initialize system into a defined state."""
     mx.initialize()
-    if mx.send(mx.Core().enable_stimulation_power(True)) != "Ok":
+    # mxwserver 实测返回 'OK' 全大写；硬编码 'Ok' 在某些版本会误判失败。
+    # 同时容忍前后空白与 None。
+    result = mx.send(mx.Core().enable_stimulation_power(True))
+    if (result or "").strip().upper() != "OK":
         raise RuntimeError("The system didn't initialize correctly.")
 
 
@@ -452,7 +455,7 @@ def connect_stim_units_with_neighbor_retry(
     stim_electrodes: List[int],
     array: mx.Array,
     max_search_radius: int = 50,
-    max_verification_iterations: int = 8,
+    max_verification_iterations: int = 100,
 ) -> Tuple[List[int], Dict]:
     """Resolve stim-unit conflicts with neighbor search plus full-set verification."""
     candidate_records: Dict[int, List[Dict[str, int]]] = {}

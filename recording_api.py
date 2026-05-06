@@ -113,12 +113,13 @@ def preview_stim_mapping(cfg: dict) -> dict:
     routing_stim_electrodes = _build_routing_stim_electrodes(cfg)
     config_file = cfg["config"]
 
+    # 按官方 8 步序列：mx.activate(wells) 必须早于 array.reset / select / route
+    mx.activate(wells)
     array = configure_array(
         rec_electrodes,
         routing_stim_electrodes,
         config_file=config_file,
     )
-    mx.activate(wells)
     _, mapping_diag = _resolve_stim_mapping(cfg, array)
     return mapping_diag
 
@@ -138,12 +139,13 @@ def setup_routing_and_units(cfg: dict) -> tuple[mx.Array, list[int]]:
             "resolved_electrodes into experiment_config.py before starting the formal experiment."
         )
     else:
+        # 按官方 8 步序列：mx.activate(wells) 必须早于 array.reset / select / route
+        mx.activate(wells)
         array = configure_array(
             rec_electrodes,
             routing_stim_electrodes,
             config_file=config_file,
         )
-        mx.activate(wells)
         stim_units, mapping_diag = _resolve_stim_mapping(cfg, array)
         _raise_if_direct_mapping_has_conflicts(mapping_diag)
 
